@@ -1,23 +1,25 @@
+// Network libraries first: M5StickCPlus defines a min() macro that breaks <chrono>
+#include <WiFi.h>
+#include <stdlib.h>
+#include <ESPAsyncWebServer.h>
+#include <ArduinoOTA.h>
+#include <ESPmDNS.h>
+#include <DNSServer.h>
 #ifdef STICKC
   #include <M5StickC.h>
 #else
   #include <M5StickCPlus.h>
 #endif
-#include <WiFi.h>
-#include <WebServer.h>
-#include <Update.h>
-#include <stdlib.h>
-#include <ESPAsyncWebServer.h>
-#include <ArduinoOTA.h>
-#include <ESPmDNS.h>
 #include "MPU6886s.h"
 #include "config.h"
 #include "util.h"
 #include "mqtt.h"
+#include "web.h"
 #include "stalta.h"
 #include "screen.h"
 
 AsyncWebServer server(80);
+DNSServer dnsServer;
 
 MPU6886s seismo;
 
@@ -25,19 +27,23 @@ STA_LTA staLta(trigger_threshold,detrigger_threshold);
 
 screen lcd;
 
+static uint32_t wifi_down_since = 0;
+static uint32_t ap_started = 0;
+
 void updateState(const char* state) {
-  publish_mqtt(MQTT_PUB_STATE, state, 1, true);
+  publish_state(state);
+}
+
+static float finiteOrZero(float v) {
+  return isfinite(v) ? v : 0;
 }
 
 String updateEvent(int16_t _x, int16_t _y, int16_t _z, float _pga) {
-  String msg = "{\"x\":\""+ String(_x) + "\",\"y\":\"" + String(_y) + "\",\"z\":\"" + String(_z) + "\",\"pga\":\""+ String(_pga,4).c_str() +"\"}";
+  float sta = slta ? finiteOrZero(staLta.getSTA()) : 0;
+  float lta = slta ? finiteOrZero(staLta.getLTA()) : 0;
+  String msg = "{\"x\":" + String(_x) + ",\"y\":" + String(_y) + ",\"z\":" + String(_z) + ",\"pga\":" + String(_pga,4) +
+               ",\"sta\":" + String(sta,4) + ",\"lta\":" + String(lta,4) + "}";
   return msg;
-}
-
-void handleReset(AsyncWebServerRequest *request) {
-  request->send(200, "text/html", "Reset OK");    
-  logln("MQTT Restart Request Received");
-  ESP.restart();
 }
 
 void calibrate_MPU() {
@@ -56,36 +62,12 @@ void calibrate_MPU() {
   calibrating = false;
   delay(100);
   seismo.getAccelAdc(&ax, &ay, &az);
-  publish_mqtt(MQTT_PUB_EVENT, updateEvent(ax,ay,az,pga).c_str(), 0, true);
+  publish_event(updateEvent(ax,ay,az,pga));
   updateState("LISTENING");
   lcd.clear_screen();
   lcd.set_brightness(lcd_brightness);
   lcd.draw_axis();
   lcd.show_title();
-}
-
-String config_processor(const String& var){
-  String server_details = "";
-  if (var == "PGAPLACEHOLDER"){
-    server_details = String(pga_trigger,4);
-  } else if (var == "BRIPLACEHOLDER"){
-    server_details = String(lcd_brightness);
-  } else if (var == "PERPLACEHOLDER"){
-    server_details = String(flush_period);
-  } else if (var == "SPKPLACEHOLDER"){
-    server_details = SPK_HAT;
-  } else if (var == "CONPLACEHOLDER"){
-    server_details = continuous_graph;
-  } else if (var == "LOGPLACEHOLDER"){
-    server_details = logging;
-  } else if (var == "SLTAPLACEHOLDER"){
-    server_details = slta;
-  } else if (var == "MASTERPLACEHOLDER"){
-    server_details = master;
-  } else if (var == "SLAVEPLACEHOLDER"){
-    server_details = slave;
-  } 
-  return server_details;
 }
 
 void eq_happening() {
@@ -100,53 +82,45 @@ void eq_happening() {
 void connectToWifi() {
   logln("Connecting to Wi-Fi...");
   WiFi.disconnect();
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
 }
 
-void onWifiEvent(WiFiEvent_t event) {
+void startSetupAP() {
+  ap_mode = true;
+  ap_started = millis();
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(apSsid().c_str(), AP_PASS);
+  dnsServer.start(53, "*", WiFi.softAPIP());
+  log("Setup access point started: "); logln(apSsid());
+  lcd.show_ap(apSsid().c_str(), WiFi.softAPIP().toString().c_str());
 }
 
 void checkConnection() {
-  if (!WiFi.isConnected() && (conn_stat != 1)) { conn_stat = 0; }
-  if (MQTT_active) {
-    if (WiFi.isConnected() && !mqttClient.connected() && (conn_stat != 3))  { conn_stat = 2; }
-    if (WiFi.isConnected() && mqttClient.connected() && (conn_stat != 5)) { conn_stat = 4;}
-  } else {
-    if (WiFi.isConnected() && (conn_stat == 1))  { conn_stat = 4; }
+  if (WiFi.isConnected()) {
+    wifi_down_since = 0;
+    if (ap_mode) { // STA connected in the meantime: close the setup access point
+      logln("[WiFi] connected, closing setup access point");
+      dnsServer.stop();
+      WiFi.softAPdisconnect(true);
+      WiFi.mode(WIFI_STA);
+      ap_mode = false;
+    }
+    return;
   }
-  switch (conn_stat) {
-    case 0:                                                       // MQTT and WiFi down: start WiFi
-      logln("[MQTT] and [WiFi] down: start [WiFi]");
-      connectToWifi();
-      conn_stat = 1;
-      waitCount = 0;
-      break;
-    case 1:                                                       // WiFi starting, do nothing here
-      logln("[WiFi] starting, wait : "+ String(waitCount));
-      waitCount++;
-      if (waitCount > WIFI_RECONNECT_TIMER) {
-        ESP.restart();
-      }
-      break;
-    case 2:                                                       // WiFi up, MQTT down: start MQTT
-      logln("[WiFi] up, [MQTT] down: start [MQTT]");
-      if (MQTT_active) connectToMqtt();
-      conn_stat = 3;
-      waitCount = 0;
-      break;
-    case 3:                                                       // WiFi up, MQTT starting, do nothing here
-      logln("[WiFi] up, [MQTT] starting, wait : "+ String(waitCount));
-      waitCount++;
-      break;
-    case 4:                                                       // WiFi up, MQTT up: finish MQTT configuration
-      if (MQTT_active) {
-        logln("[WiFi] up, [MQTT] up: Connected");
-      } else {
-        logln("[WiFi] up, [MQTT] button disabled: Connected");
-      }
-      conn_stat = 5;  
-      waitCount = 0;                  
-      break;
+  if (ap_mode) {
+    dnsServer.processNextRequest();
+    if (millis() - ap_started > AP_TIMEOUT_MS && WiFi.softAPgetStationNum() == 0) {
+      logln("[WiFi] setup access point timeout, restarting");
+      ESP.restart();
+    }
+    return;
+  }
+  if (wifi_down_since == 0) {
+    logln("[WiFi] down, reconnecting");
+    wifi_down_since = millis();
+    WiFi.reconnect();
+  } else if (millis() - wifi_down_since > WIFI_RECONNECT_TIMER * 100UL) {
+    ESP.restart();
   }
 }
 
@@ -161,32 +135,28 @@ void setup() {
 #endif
 
   pref_init(); // Read Parameters
+  net_pref_init();
   pinMode(M5_LED, OUTPUT); // Setup M5 Red LED
   digitalWrite(M5_LED, HIGH);
 
   ledcSetup(spkChannel, spkFreq, spkResolution); // Setup SPK_HAT
   ledcAttachPin(SPK_pin, spkChannel);
   ledcWriteTone(spkChannel, 0);
-  lcd.show_wifi_connect();  
-  initMqtt(); //Initialize MQTT Server Parameters
+  lcd.show_wifi_connect();
 
   WiFi.mode(WIFI_STA);
-  WiFi.onEvent(onWifiEvent);
   WiFi.setHostname(WIFI_HOSTNAME);
-  connectToWifi();
+  WiFi.setAutoReconnect(true);
+  initMqtt(); //Initialize MQTT Server Parameters
+  if (!wifi_ssid.isEmpty()) connectToWifi();
 
-  while (WiFi.status() != WL_CONNECTED) {
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && !wifi_ssid.isEmpty() && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
     delay(100);
-    waitCount++;
-    if (waitCount > (WIFI_RECONNECT_TIMER)) {
-      ESP.restart();
-    }
   }
-  
-  if (MQTT_active) connectToMqtt();
+  if (WiFi.status() != WL_CONNECTED) startSetupAP();
 
-  WebSerial.begin(&server);
-  webSerialEnabled = true;
+  initWeb(server);
 
   ArduinoOTA
     .onStart([]() {
@@ -220,54 +190,26 @@ void setup() {
 
   pga_trigger_changed = pga_trigger;
 
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {request->send_P(200, "text/html", index_html,config_processor);});
-  server.on("/rt", HTTP_GET, [](AsyncWebServerRequest *request){handleReset(request);});
-  server.on("/recal", HTTP_GET, [](AsyncWebServerRequest *request){
-    calibrating = true;
-    request->send(200, "text/html", "Recalibrating MPU");
-    });
-  server.on("/sv", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (request->hasParam("new_pga") && (request->getParam("new_pga")->value() != "")) {
-      pga_trigger_changed = request->getParam("new_pga")->value().toFloat();
-    }
-    if (request->hasParam("new_bri") && (request->getParam("new_bri")->value() != "")) {
-      lcd_brightness = request->getParam("new_bri")->value().toInt();
-      lcd.set_brightness(lcd_brightness);
-    }
-    if (request->hasParam("new_per") && (request->getParam("new_per")->value() != "")) {
-      flush_period = request->getParam("new_per")->value().toInt();
-    }
-    if (request->hasParam("spk")) {
-      if (request->getParam("spk")->value() == "on") SPK_HAT = true; else SPK_HAT = false;
-    } else SPK_HAT = false;
-    if (request->hasParam("slta")) {
-      if (request->getParam("slta")->value() == "on") slta = true; else slta = false;
-    } else slta = false;
-    if (request->hasParam("con")) {
-      if (request->getParam("con")->value() == "on") continuous_graph = true; else continuous_graph = false;
-    } else continuous_graph = false;
-    if (request->hasParam("lg") && (request->getParam("lg")->value() != "")) {
-      logging = (request->getParam("lg")->value().toInt());
-    }
-    if (request->hasParam("master")) {
-      if (request->getParam("master")->value() == "on") master = true; else master = false;
-    } else master = false;
-    pref_update();
-    request->send(200, "text/html", "Settings Changed");
-    request->redirect("/");
-  });
-  server.onNotFound([](AsyncWebServerRequest *request){request->send(404);});
+  // Connect to MQTT before calibrating, so that the calibration states are published
+  mqttLoop();
+  start = millis();
+  while (MQTT_active && WiFi.isConnected() && !mqttConnected() && millis() - start < 5000) delay(100);
 
-  server.begin();
   calibrate_MPU();
 }
 
 void loop() {
   checkConnection();
   ArduinoOTA.handle();
+  mqttLoop();
   if (!calibrating) {
     M5.update();
     seismo.getAccelAdc(&ax, &ay, &az);
+
+    if (lcd_brightness_dirty && !eq_status) {
+      lcd_brightness_dirty = false;
+      lcd.set_brightness(lcd_brightness);
+    }
 
     if (slta) {
       lcd.show_method(slta, true);
@@ -276,13 +218,13 @@ void loop() {
         pga_trigger = pga_trigger_changed;
         lcd.show_method(false, true);
         updateState("CHANGED_PGA_TRIGGER");
-        publish_mqtt(MQTT_PUB_PGA_TRIGGER, String(pga_trigger,4).c_str(), 1, true);
+        publish_pga_trigger();
         updateState("LISTENING");
       }
       lcd.show_method(false,false,pga_trigger);
     }
 
-    lcd.show_mqtt(mqttClient.connected());
+    lcd.show_mqtt(mqttConnected());
 //    lcd.draw_axis();
 
     x_vector_mag = ax / gravity - 1.0;
@@ -324,6 +266,9 @@ void loop() {
       }
     }
 
+    live_sta = slta ? finiteOrZero(staLta.getSTA()) : 0;
+    live_lta = slta ? finiteOrZero(staLta.getLTA()) : 0;
+
     if (eq_status) { // Earthquake still happening
       eq_time_count++ ;
 
@@ -333,32 +278,36 @@ void loop() {
 
           updateState("LISTENING");
 
-          publish_mqtt(MQTT_PUB_EVENT, updateEvent(ax,ay,az,pga).c_str(), 0, true);
+          publish_event(updateEvent(ax,ay,az,pga));
 
           digitalWrite(M5_LED, HIGH);
           if (SPK_HAT) ledcWriteTone(spkChannel, 0);
           lcd.set_brightness(lcd_brightness);
       } else {
-        if (eq_time_count%2) publish_mqtt(MQTT_PUB_EVENT, updateEvent(ax,ay,az,pga).c_str(), 0, true);
+        if (eq_time_count%2) publish_event(updateEvent(ax,ay,az,pga));
       }
     } else {
         if (flush_update) { // Send periodic event update message
         flush_event++;
         if (flush_event > (flush_period*10)) {
-          publish_mqtt(MQTT_PUB_EVENT, updateEvent(ax,ay,az,pga).c_str(), 0, true);
+          publish_event(updateEvent(ax,ay,az,pga));
           flush_event = 0;
         }
       }
     }
 
+    if (force_event_publish) { // Requested from MQTT / web
+      force_event_publish = false;
+      publish_event(updateEvent(ax,ay,az,pga));
+    }
+
     if (M5.BtnA.wasPressed()) {
-      if (mqttClient.connected()) {
+      if (mqttConnected()) {
         updateState("MQTT_BUTTON_DISCONNECT");
-        MQTT_active = false;
-        mqttClient.disconnect();
+        mqttSetActive(false);
       } else {
         updateState("MQTT_BUTTON_CONNECT");
-        MQTT_active = true;
+        mqttSetActive(true);
       }
     }
 
@@ -366,10 +315,9 @@ void loop() {
       ESP.restart();
     }
 
+    webLoop();
     delay(100);    
   } else {
     calibrate_MPU();
   }
 }
-
-

@@ -1,7 +1,7 @@
 #ifndef _util_H_
 #define _util_H_
 
-#include <WebSerial.h>
+#include <Arduino.h>
 #include <Preferences.h>
 
 // Seismic Measuring Variables
@@ -16,7 +16,7 @@ https://en.wikipedia.org/wiki/Japan_Meteorological_Agency_seismic_intensity_scal
 */
 extern uint16_t flush_event;
 extern bool flush_update;
-extern bool calibrating;
+extern volatile bool calibrating;
 
 // Parameters
 extern bool SPK_HAT;
@@ -28,20 +28,30 @@ extern bool slta; // true: use STA/LTA Method instead of trigger
 extern bool master;
 extern bool slave;
 
-extern unsigned long waitCount;
-extern uint8_t conn_stat;
+// Network parameters (stored in flash, defaults from secrets.h / config.h)
+extern String wifi_ssid, wifi_pass;
+extern String mqtt_host, mqtt_user, mqtt_pass, mqtt_base, mqtt_slave_topic, ha_prefix;
+extern uint16_t mqtt_port;
+extern bool mqtt_enabled, ha_discovery;
+extern String web_user, web_pass;
+
+// Requests from web / MQTT handlers, executed by the main loop
+extern volatile bool lcd_brightness_dirty;
+extern volatile bool force_event_publish;
 
 // Logging
-extern uint8_t logging; // 0: None, 1: Serial only, 2: WebSerial only, 3: Serial and WebSerial
+extern uint8_t logging; // 0: None, 1: Serial only, 2: Web log only, 3: Serial and Web log
 
-extern bool webSerialEnabled; // Disable until WebSerial is loaded
+extern bool webSerialEnabled; // Disable until the web log is ready
 
 extern Preferences preferences; // To store and read parameters
+
+void weblog_write(const String& msg, bool eol);
 
 template<typename T>
 void logln(T msg) {
   if (logging == 1 || logging == 3) Serial.println(msg);
-  if ((logging == 2 || logging == 3) && webSerialEnabled) WebSerial.println(msg);
+  if ((logging == 2 || logging == 3) && webSerialEnabled) weblog_write(String(msg), true);
 }
 
 template<typename T, typename U>
@@ -49,13 +59,13 @@ void logln(T msg, U digits) {
   char msgStr[6];
   dtostrf(msg, 6,digits, msgStr);
   if (logging == 1 || logging == 3) Serial.println(msgStr);
-  if ((logging == 2 || logging == 3) && webSerialEnabled) WebSerial.println(msgStr);
+  if ((logging == 2 || logging == 3) && webSerialEnabled) weblog_write(String(msgStr), true);
 }
 
 template<typename T>
 void log(T msg) {
   if (logging == 1 || logging == 3) Serial.print(msg);
-  if ((logging == 2 || logging == 3) && webSerialEnabled) WebSerial.print(msg);
+  if ((logging == 2 || logging == 3) && webSerialEnabled) weblog_write(String(msg), false);
 }
 
 template<typename T, typename U>
@@ -63,10 +73,15 @@ void log(T msg,U digits) {
   char msgStr[6];
   dtostrf(msg, 6,digits, msgStr);
   if (logging == 1 || logging == 3) Serial.print(msgStr);
-  if ((logging == 2 || logging == 3) && webSerialEnabled) WebSerial.print(msgStr);
+  if ((logging == 2 || logging == 3) && webSerialEnabled) weblog_write(String(msgStr), false);
 }
 
 void pref_init();
 void pref_update();
+void net_pref_init();
+void net_pref_update();
+
+void scheduleRestart(uint32_t delay_ms = 500);
+String deviceId();
 
 #endif

@@ -29,7 +29,7 @@ PGA gives intensity too, but i do not know how reliable that is.
 
 ## Usage
 
-This is a Platformio code. First of all, the user needs to fill WiFi and MQTT server details in main.cpp. Other parameters like Seismic, MPU calibration or screen properties can be changed for best fit after some tests and trials. Also for M5stickC select **env:M5stick-c** and for M5StickC-Plus select **env:M5stick-c-plus** in Platformio.
+This is a Platformio code. First of all, copy `src/secrets.example.h` to `src/secrets.h` (git-ignored) and fill WiFi and MQTT server details. These are only defaults: WiFi, MQTT and Home Assistant settings can be changed later from the web interface and are stored in flash. If WiFi cannot connect within 30 seconds, SeismoM5 starts the access point **seismoM5-Setup-xxxxxx** (password `seismom5`) with the configuration page at http://192.168.4.1. Other parameters like Seismic, MPU calibration or screen properties can be changed for best fit after some tests and trials. Also for M5stickC select **env:M5stick-c** and for M5StickC-Plus select **env:M5stick-c-plus** in Platformio.
 
 Button A of M5stickC toggles MQTT server connection. If bottom right corner of the screen shows MQTT, the server is connected.
 
@@ -60,9 +60,23 @@ Button B of M5stickC resets M5StickC for recalibration purposes.
 
 ### Events: seismoM5/event
 
-**{"x":"-85","y":"-1097","z":"16305","pga":"0.0007"}**   <sup>Sample</sup>
+**{"x":-85,"y":-1097,"z":16305,"pga":0.0007,"sta":0.0000,"lta":0.0000}**   <sup>Sample</sup>
 
-Momentary x,y,z parameters and PGA in (g). Only send while an earthquake occurs.
+Momentary x,y,z raw accelerometer values, PGA in (g) and STA/LTA (only when the STA/LTA method is active). Sent while an earthquake occurs, every "update period" seconds and on request. Since v2.0 values are JSON numbers (templates like `{{ value_json.pga }}` keep working).
+
+### Settings: seismoM5/settings (retained)
+
+**{"pga_trigger":0.0250,"lcd_brightness":7,"update_period":60,"speaker_enable":false,"continuous_graph":true,"sta_lta":false,"master":false,"slave":false,"logging":3}**
+
+Published at connection and after every change (web, MQTT or button).
+
+### Diagnostics: seismoM5/diag (retained)
+
+**{"rssi":-61,"ip":"192.168.1.50","uptime":3600,"heap":180000,"reconnects":0,"version":"2.0.0"}**
+
+Published every 60 seconds.
+
+The base topic (`seismoM5`) can be changed from the web interface. The MQTT client reconnects automatically with an exponential back-off (2 s – 60 s) and uses a unique client id (`seismoM5-xxxxxx`).
 
 PGA results can be compared with the values in:
 
@@ -89,7 +103,11 @@ Should be send in JSON format as follows:
     "speaker_enable" : true,
     "lcd_brightness" : 7,
     "continuous_graph" : false,
-    "update_period" : 30
+    "update_period" : 30,
+    "sta_lta" : false,
+    "master" : false,
+    "logging" : 3,
+    "recalibrate" : false
 }
 ```
 There is no need to send this full message, any item can be send standalone or together with any other item.
@@ -108,6 +126,14 @@ There is no need to send this full message, any item can be send standalone or t
 
 **"update period" : *int***  - Sets the update period of event mqtt message to be send, even there is no earthquake, in seconds.
 
+**"sta_lta" : *bool***  - If true, uses the STA/LTA trigger method instead of the PGA threshold.
+
+**"master" : *bool***  - Enables the Master mode (see Master / Slave Configuration).
+
+**"logging" : *int***  - 0: None, 1: Serial, 2: Web log, 3: Both.
+
+**"recalibrate" : *bool***  - If true, recalibrates the MPU6886 without restarting.
+
 
 ## SeismoM5 Web Page
 
@@ -115,27 +141,21 @@ There is no need to send this full message, any item can be send standalone or t
 <img src="pics/Screenshot 2023-01-29 at 21.01.02.jpg" width="245" height="371">
 </p>
 
-You can connect to SeismoM5 either with http://seismom5.local address or its IP address to monitor or change:
+You can connect to SeismoM5 either with http://seismom5.local address or its IP address. The responsive web interface (light/dark theme) has these tabs:
 
-- Change PGA Trigger Value
+- **Dashboard**: live state, PGA, trigger, STA/LTA, live chart, MQTT/WiFi status (pushed with Server-Sent Events, no page reload).
 
-- Change standby LCD Brightness
+- **Detection**: PGA trigger, STA/LTA method, event update period, LCD standby brightness, speaker, continuous graph, master mode, logging.
 
-- Change the update period of event mqtt message to be send, even there is no earthquake, in seconds
+- **MQTT / HA**: broker host/port/credentials, base topic, slave state topic, Home Assistant MQTT Discovery and prefix, republish discovery.
 
-- Use STA/LTA Method for triggering, this disables PGA Triggering.
+- **Network**: WiFi SSID/password and optional login (HTTP basic auth) for the web interface.
 
-- Enable/Disable Speaker
+- **Log**: live log (replaces WebSerial; `/webserial` redirects here).
 
-- Enable/Disable continuous graph
+- **System**: recalibrate MPU, toggle MQTT, restart, firmware info.
 
-- Change Logging Type (Serial, WebSerial, Both or None)
-
-- WebSerial Output
-
-- Recalibrate MPU
-
-- Restart SeismoM5 ESP32
+JSON API: `GET /api/status`, `GET /api/settings`, `POST /api/settings` (form encoded, same keys as `/api/settings`), `POST /api/action` with `do=restart|recalibrate|update|discovery|mqtt_toggle`, `GET /events` (SSE). The old endpoints `/sv`, `/rt` and `/recal` still work. Passwords are never returned by the API.
 
 ## OTA Firmware Upload
 
@@ -186,8 +206,8 @@ This was the Compiler installation part. Now we will open and upload SeismoM5 to
 3. Select "Open". PIO Home Page will come up. Press "Open Project" button from this page. Select the Folder of unzipped SeismoM5 and press open.
 4. Wait for some time for PIO to open and set everything up for this project.
 5. From the bottom blue bar of VSCode, click on where it writes "Default (seismom5)" and select "env:m5stick-c-plus" or "env:m5stick-c" from there.
-6. Now we will set the config parameters. Click "Explorer" on the left vertical band and open the "config.h" file under src folder.
-7. In this file you need to enter these parameters:
+6. Now we will set the config parameters. Click "Explorer" on the left vertical band, copy "secrets.example.h" under src folder to "secrets.h" and open it.
+7. In this file you need to enter these parameters (they can also be set later from the web interface / setup access point):
 ```
 //WiFi Parameters
 #define WIFI_SSID "XXXXXXXX"
@@ -206,7 +226,15 @@ This was the Compiler installation part. Now we will open and upload SeismoM5 to
 <img src="pics/S5_graph.jpg" width="382" height="200">
 </p>
 
-Here is the configuration that you should add to configuration.yaml:
+### Option 1: MQTT Discovery (recommended)
+
+Enable **MQTT Discovery** in the "MQTT / HA" tab of the web interface. Home Assistant creates the device *seismoM5* with: State, Earthquake (binary sensor), PGA, PGA trigger, STA/LTA, raw X/Y/Z, configuration entities (PGA trigger threshold, LCD brightness, update period, speaker, continuous graph, STA/LTA method, master mode, logging), buttons (Restart, Recalibrate MPU, Request event update) and diagnostics (WiFi signal, IP, uptime). Discovery is republished when Home Assistant restarts (`homeassistant/status` = `online`). Disabling it removes the entities.
+
+If you used the manual YAML below, remove it to avoid duplicate entities (the discovered ones may otherwise get a `_2` suffix).
+
+### Option 2: manual YAML
+
+Here is the configuration that you can add to configuration.yaml (still fully compatible):
 
 ```
 mqtt:

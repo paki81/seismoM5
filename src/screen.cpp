@@ -16,6 +16,22 @@ void screen::show_wifi_connect() {
     M5.Lcd.print("CONNECTING WiFi...");
 }
 
+void screen::show_ap(const char* _ssid, const char* _ip) {
+    M5.Lcd.setRotation(1);
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setTextColor(YELLOW,BLACK);
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setCursor(2, 5);
+    M5.Lcd.print("WiFi FAILED - SETUP AP");
+    M5.Lcd.setTextColor(WHITE,BLACK);
+    M5.Lcd.setCursor(2, 25);
+    M5.Lcd.print(_ssid);
+    M5.Lcd.setCursor(2, 40);
+    M5.Lcd.print("http://");
+    M5.Lcd.print(_ip);
+    delay(5000);
+}
+
 void screen::show_wait() {
     M5.Lcd.setRotation(1);
     M5.Lcd.fillScreen(BLACK);
@@ -233,5 +249,10 @@ void screen::clear_screen() {
 }
 
 void screen::set_brightness(uint8_t _brightness) {
+#ifdef STICKC
   M5.Axp.ScreenBreath(_brightness); // Full Brightness
+#else
+  // M5StickCPlus >= 0.1 expects 0-100 %, keep the historical 7-15 scale for the settings
+  M5.Axp.ScreenBreath(constrain(((int)_brightness - 7) * 100 / 7, 0, 100));
+#endif
 }
