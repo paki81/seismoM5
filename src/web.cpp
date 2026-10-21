@@ -220,6 +220,8 @@ static void handleLegacySave(AsyncWebServerRequest* request) {
 void initWeb(AsyncWebServer& server) {
   log_mutex = xSemaphoreCreateMutex();
 
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
+
   server.addMiddleware([](AsyncWebServerRequest* request, ArMiddlewareNext next) {
     if (!web_user.isEmpty() && !request->authenticate(web_user.c_str(), web_pass.c_str())) {
       return request->requestAuthentication(AsyncAuthType::AUTH_BASIC, WIFI_HOSTNAME);
