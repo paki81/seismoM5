@@ -70,6 +70,7 @@ void publish_mqtt(const String& topic, const char* msg, uint8_t qos, bool retain
 }
 
 void publish_state(const char* state) {
+  if (mqtt_state == state) return; // Publish transitions only (eq_happening() runs on every tick above the trigger)
   mqtt_state = state;
   publish_mqtt(t_state, state, 1, true);
   log("STATE: "); logln(state);
